@@ -1,0 +1,276 @@
+---
+title: "Tuning Neural Networks with R"
+output: html_notebook
+---
+
+
+How do I chose the number of layers in my Neural Network? How many neurons should each layer have and why? Why is this so important? 
+
+In the following Kernel I'll try to boil down questions like these and find understandable answers to them. 
+
+# Dataset
+
+MNIST ("Modified National Institute of Standards and Technology") is the de facto “hello world” dataset of computer vision. Since its release in 1999, this classic dataset of handwritten images has served as the basis for benchmarking classification algorithms. The goal here is to train an algorithm that is capable of labelling the handwritten numbers corretly.
+
+We'll use this as an opportunity to discuss some details on training and tuning of simple *Neural Networks with R*.
+
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(data.table)
+library(h2o)
+library(caret)
+library(harrypotter)
+library(gridExtra)
+```
+
+So let's get started.
+
+# Architecture of a Neural Network
+
+Every Neural Network (NN) has three types of layers: _input_, _output_ and _hidden_. Let's describe them one by one:
+
+## Input Layer
+
+Very simple. Every NN has exactly one *Input Layer*. No more, no less, and no exceptions that I'm aware of.
+
+But, how many neurons has the Input Layer? Can be chosen? Well, no. The number of neurons in an Input Layer is uniquely determined by the number of _features_ of your data, plus a bias term.
+
+Wait what? What is a biased term? Actually, not every neural network architecture includes a biased term; but they normally should. This additional node *allows you to shift the activation function*, which can be critical for successful training.
+
+### Bias Term
+
+As you might know by now, neurons in a Neural Network are connected by an activation function. This function is usually a _sigmoid_. Which is defined as follows:
+
+$$S(x) = \frac{1}{1 + e^{-x}}$$
+
+Consider a 1-input, 1-output network that has no bias. The output of the network is computed by multiplying the `input` by the weight $w_1$ and passing the result through the activation function.
+
+We can draw how this function would look like for various values of $w_1$:
+
+
+```{r}
+sig <- function(x){
+	1 / (1 + exp(-x))
+}
+
+x <- seq(-5, 5, 0.01)
+
+tibble(`sig(0.5x)` = sig(0.5*x), `sig(1x)` = sig(x), `sig(2x)` = sig(2*x), input = x) %>% 
+	melt(id.vars = "input") %>% 
+	ggplot(aes(y = value, x = input)) +
+	geom_line(aes(colour = variable), size = 0.8) +
+	scale_colour_hp(discrete = TRUE, house = "Ravenclaw", name = "") +
+	xlab("Input") +
+	ylab("Output")
+```
+
+As you can see, changing the weight $w_1$ basically changes the _steepness_ of the sigmoid, not its position. That's useful, but what if you wanted the network to output $0$ when this neuron outputs $2$. You can't do that by just changint the steepness. You would want to be able to *shift* the entire curve to the right.
+
+And that is exactly what the bias allows you to do. Our function $sig(w_1x)$ becomes $sig(w_1x_1 + w_0)$. This additional term $w_0$ that has no relationship with any input $x$ gives the network this flexibility.
+
+```{r}
+x <- seq(-10, 10, 0.01)
+
+tibble(`sig(x - 5)` = sig(x - 5), `sig(x)` = sig(x), `sig(x + 5)` = sig(x + 5), input = x) %>% 
+	melt(id.vars = "input") %>% 
+	ggplot(aes(y = value, x = input)) +
+	geom_line(aes(colour = variable), size = 0.8) +
+	scale_colour_hp(discrete = TRUE, house = "Ravenclaw", name = "") +
+	xlab("Input") +
+	ylab("Output")
+```
+Now that we have this additional term, we are allowed to build a network that is capable of outputting $0$ when the input $x$ is 2. Whereas without the bias term it simply wasn't possible.
+
+## Output Layer
+
+Like the Input Layer, every NN has just one output layer. And determining its size is just as simple: It is completely determined by the model configuration. It will depend on the kind of _output_ the NN is giving. 
+
+* If the NN is a *regressor*, the output layer has one single node.
+* If the NN is a *classifier*, the output layer has one node per class label in your model.
+
+So in our case, that we want to train the NN to be able to recognize hand-written digits, our output layer would have $10$ nodes. On node per digit, which would output a probability. But what would happen if our NN outputs a probability higher than $0.5$ for more than one digit? Imagine that our NN outputs a probability of $0.87$ for a given instance to be a $7$ and a probability of $0.91$ of being a $1$? (rest possibilities have probability $0$) Numbers $7$ and $1$ can look quite similar in hand-written style, so this example shouldn't be so rare. How do we handle this situation?
+
+The simplest approach is the most obvious one, we just label the output taking the higher probability. In this case, our NN would label the result as $1$. It is the most probable, right? This is called _Max-Layer Output_ and it is actually helpful and solves the problem. But if you had to write down a function for this, it would be tricky - and more importantly - it would be *non-differentiable*.
+
+### Differentiability in NN.
+
+What does _non-differentiable_ means, and why is this important for training Neural Networks?
+
+Let's first understand what differentiable means. A functions is said to be differentiable if its derivative exists at all points ( [More on Differentiable functions](https://en.wikipedia.org/wiki/Differentiable_function) ). Or, as mathematicians like to say: The function is _smooth_ and _well behaved_.
+
+When we say that a function is _well behaved_, we usually mean that we don't expect any sudden jerk in its value, never. This proporety allows us to do pretty fancy stuff, such as extraploate and interpolate the function being reasonably sure that our predictions are close to the real thing. This is something that we assume in our Machine Learning algorithms.
+
+Hence, differentiability is something that we assume to be true in the functions we use in our Neural Networks.
+
+So that strategy about getting the maximum probability on any node within the output layer is non-differentiable. What alternatives do we have? Commonly, what you will see is the so called *Softmax Function*.
+
+### Softmax Function
+
+Softmax function is the fancy name for the normalized exponential function. Which is a generalization of the logistic function that squeezes a multi-dimensional vector of real values into a vector of values between $0$ and $1$ that, together, add up to $1$.
+
+$$P(\vec{x}) = \frac{x^T w_j}{\sum_{k=1}^K e^{x^T w_k}}$$
+
+Don't run away yet, please. I know this looks scary. You don't need to get into the details, just get the idea that - effectively - we are just normalizing that max-layer output thing into a smooth function. This way, our previous example would have gotten probabilities of $0.51$ for number $1$ and $0.49$ for number $7$, whilst the rest are $0$. See that we can still chose the highest and label the output correctly, but now they sum up to $1$ and the function that defines them is smooth.
+
+## Hidden Layer
+
+To the interesting stuff: Hidden Layers.
+
+*How many Hidden Layers?* 
+
+* If your data is *linearly separable* then you don't need any hidden layers at all. As a matter of fact, you don't even need to use a Neural Network for this problem. [Linear Regressions](https://en.wikipedia.org/wiki/Linear_regression) were build for these situations. You should be using them instead. Your Neural Network will be able to do it, but less effectively and with much more computational effort. You are *overkilling*.
+
+* If your variables are more complex than _linear_, let's say you want to consider *quadratic interactions*, then you are looking for *one hidden layer* configurations.
+
+* If you want to consider *cubic interactions*, you need *two hidden layers* configurations.
+
+See the pattern? For your model to be able to be trained with *K* order interactions, you need a configuration of *K-1* hidden layers. Easy, right? Well, not that much. How do you know the level of interactions your data is showing? That is the tricky part, and that is one of the reasons why everyone is repeating the same mantra to rookies: *Know your data before considering building a Machine Learning algorithm*. And they are very much right. 
+
+You could say that it is always safer to build the Neural Network as complex as you can get, overkill your problem and you'll algorithm will train itself to fit the reality. Better safe than sorry, right? You don't want to miss a $53$ order interaction by going cheap on Hidden Layers, so let's roll it and build a huge NN that will do the messy work for you. And you'd be kinda right. But you are going to stump upon two ugly-faced constraints: *Time* and *Generalizability*.
+
+### Guaranteeing Generalizability
+
+One of the biggest concerns of any Machine Learning model is its _Generalizability_. It is an ugly word, I know. What it simply means is the capability of your model to handle equally well data from which it didn't receive any training. You can train a model to be extremely accurate predicting the outputs of the training data set, whilst being utterly useless predicting anything outside that. 
+
+We've just found the monster all Machine Learning Engineers are afraid of. The one they all talk about. He's here! _SIRIUS BLACK !!_
+
+Sorry, just joking. Is not Sirius Black, it's *Overfitting*. You should already have a broad idea of what _overfitting_ means by now. But how this has aneything to do with the number of Hidden Layers? Well, every model is not capable of differentiating _causality_ from _coincidence_.
+
+Imagine that you have a medical data set where $70%$ of the patients who died from [Heart Failure](https://www.nhs.uk/conditions/heart-failure/) were left-handed. Would that mean that being left-handed is an important variable in order to prevent heart conditions? Should we ask patients which is their dominant hands for  diagnosis? Or is it just a coincidence? A researcher would cautiously publish that _we need more data before stating anything in firm_, or that it lacks _statistical significance_. Which is true in both cases, getting more data is the best way of confirming or discarding this heterogeneity in the data.
+
+If it's just a coincidence, only present in your data set, most models would learn that af it were a _causal relationship_ between that fact and heart conditions, and will extraploate it for future predictions. This will contribute enormously to increase their bias, and thus more misclassifications. You don't want your model to do that. This _coincidences_ is what we usually call *noise* in the data. You don't want your model to learn the *noise* and get confused on new data.
+
+Increasing the complexity of a Neural Network by adding hidden layers is a great way to overfitting, because it increases the chances of creating variables out of noise. A $53$ degree interaction between the variables is far more likely to be just noise than anything meaningful. But between linear interactions and $53$ there must be some sweetspot where our model is complex enough to gasp the non-obvious relationships, but not so complex to get fooled by noise. How do we get to that point?
+
+There are a myriaf of exotic techniques in order to avoid that. You can do some [regularization](https://en.wikipedia.org/wiki/Regularization_(mathematics)), check your generalizability by [Cross Validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics)), [dropping out](https://en.wikipedia.org/wiki/Dropout_(neural_networks)) some neurons on the way of training your Neural Network, etc. But today I want to stick to the simple stuff. We are building a feeding-forward Neural Network and we want to chose the proper amount of neurons and hidden layers in our architecture, and stick with that. Once we master this simple stuff, we'll get more fancy and build smarter configurations.
+
+A general rule of thumb that I like to apply in order to decide to decide the number of _total_ neurons in the hidden layers, is this following formula:
+
+$$N_h = \frac{n_s}{\alpha (N_i + N_o)}$$
+
+Where
+
+* $N_i$ is the number of _input_ neurons.
+* $N_o$ is the number of _output_ neurons.
+* $n_s$ is the number of _samples_ in the training  data set.
+* $\alpha$ is an arbitrary scaling factor between 1 and 10.
+
+This not solves the problem by itself, but now it is boiled down. Our concern would be to decide which is the $\alpha$, which is much simpler.
+
+Now we are going to build Neural Networks using this rule of thumb and evaluate an optimal value for $\alpha$.
+
+We load the data,
+
+```{r, message = FALSE, warning = FALSE}
+digit <- fread("data/train.csv") %>% 
+	mutate(label = as.factor(label))
+```
+
+
+Our $n_s$ will be the number of instances:
+```{r}
+n_instances <- nrow(digit)
+n_s <- n_instances
+```
+
+
+The value for $N_o$ is going to be simply the number of possible solutuions of our problem:
+
+```{r}
+N_o <- digit$label %>% unique() %>% length()
+```
+
+The value of our $N_i$ needs to be the number of variables plus the bias term. And the number of variables is the number of columns minus the `label`, so
+
+```{r}
+N_i <- ncol(digit) - 1 + 1
+```
+
+
+So the number of neurons present in hidden layers will be:
+
+```{r}
+alpha <- seq(1,10, by=0.1)
+N_h <- n_s/(alpha*(N_i + N_o))
+N_h
+```
+
+
+
+
+
+# Facing *Time* Constraints
+
+One of the limitations that should concern the real-world applicability of Neural Network models is the training time. Even though this dataset is small and time shouldn't be an issue, it is interesting to highlight how much time it _costs_ us to increase the accuracy of a model. It is usual to think that higher accuracy is always worth the time the model needs to train. Which is normally the case in Kaggle Competitions, but not so in some business applications. In some scenarios, time matters.
+
+Now we are going to measure how the accuracy of a model increases by increasing its complexity. The more complex the more accurate (in this example), but the longer it takes to compute. 
+
+In order to measure it, we'll just train a simple Neural Network usuing the `h2o` package and use it for different levels of complexity. We are going to evaluate the performance of our model in a validation set and we'll write down how much time it took every time.
+
+```{r, message = FALSE, warning = FALSE}
+digit <- fread("data/train.csv") %>% 
+	mutate(label = as.factor(label))
+```
+
+```{r}
+n_iters <- 1e2
+n_instances <- nrow(digit)
+acc <- c()
+time <- c()
+
+tic()
+for(i in 1:n_iters){
+	m <- sample(seq(from = 1, to = n_instances), n_instances*0.8, replace = FALSE)
+	train <- digit[m,]
+	val   <- digit[-m,]
+	h2o_train <- as.h2o(train)
+	h2o_val   <- as.h2o(val)
+
+	time[i] <- system.time({
+		h2o_model <- h2o.deeplearning(x = setdiff(names(train), c("label")),
+																y = "label",
+																training_frame = h2o_train,
+																standardize = TRUE,
+																hidden = c(10 + i*2,10 + i*2,10 + i*2),
+																rate = 0.05,
+																epochs = 10)
+	})[1][[1]]
+	h2o_predictions <- as.data.frame(h2o.predict(h2o_model, h2o_val))
+	print(acc[i] <- confusionMatrix(h2o_predictions$predict, val$label) %>% .$overall %>% .["Accuracy"] %>% .[[1]])
+}
+
+results_time <- tibble(Accuracy = acc, Time = time, Iteration = 1:n_iters) 
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+gg_ite <- results_time %>% 
+	ggplot(aes(x = 30 + 9*Iteration, y = Time)) +
+	geom_jitter(colour = hp(10, house = "Ravenclaw")[[10]]) +
+	geom_smooth(colour = hp(10, house = "Gryffindor")[[1]]) +
+	xlab("Number of Neurons") +
+	ylab("Time (Minutes)")
+
+gg_time <- results_time %>% 
+ggplot(aes(x = Time, y = Accuracy)) +
+	geom_jitter(colour = hp(10, house = "Ravenclaw")[[10]]) +
+	geom_smooth(colour = hp(10, house = "Ravenclaw")[[1]]) +
+	xlab("Time (Minutes)")
+
+gg_neurs <- results_time %>% 
+	ggplot(aes(x = 30 + 9*Iteration, y = Accuracy)) +
+	geom_jitter(colour = hp(10, house = "Ravenclaw")[[10]]) +
+	geom_smooth(colour = hp(10, house = "Slytherin")[[8]]) +
+	xlab("Number of Neurons")
+
+grid.arrange(gg_ite, gg_neurs, gg_time,
+						 layout_matrix = rbind(c(1, 1),
+						 											c(2, 3))
+						 )
+```
+
+As we can see, the dependency between our way complexity bypass (Number of Neurons) and time to compute is beautifully linear. Which basically is telling you that the greater the complexity of the model, the greater the time to compute.
+
+On the other hand, the increase in accuracy reaches a roof. It loses its momentum beyond some point and it is not linear anymore. It something slower than linear. I don't want to enter into the details of modelling this dependency, but it is obvious that increasing the complexity and computation time has a scarce payoff, beyond some point.
+
+So you could say that increasing computational time is worth it, up to some point. At that point you see that the accuracy is not going to get any much better by simple brute force.
