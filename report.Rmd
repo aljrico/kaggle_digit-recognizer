@@ -1,6 +1,18 @@
+<center><font size=7>Tuning Neural Networks with R</font></center>
+***
+
 ---
-title: "Tuning Neural Networks with R"
-output: html_notebook
+title: ""
+author: "Alejandro Jiménez Rico"
+output:
+ html_document:
+    fig_width: 10
+    fig_height: 7
+    toc: yes
+    number_sections : yes
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
 ---
 
 
@@ -22,7 +34,29 @@ library(h2o)
 library(caret)
 library(harrypotter)
 library(gridExtra)
+
+h2o.init()
 ```
+
+```{r, message = FALSE, warning = FALSE}
+digit <- fread("data/train.csv") %>% 
+	mutate(label = as.factor(label))
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+
+# Quick and dirty data augmentation
+digit2 <- digit
+digit2[,-1] <- digit2[,-1]/pi
+digit <- rbind(digit,digit2)
+
+digit3 <- digit
+digit3[,-1] <- sqrt(digit3[,-1]/255)*255
+digit <- rbind(digit,digit3)
+
+rm(digit2,digit3);gc()
+```
+
 
 So let's get started.
 
@@ -141,31 +175,27 @@ Imagine that you have a medical data set where $70%$ of the patients who died fr
 
 If it's just a coincidence, only present in your data set, most models would learn that af it were a _causal relationship_ between that fact and heart conditions, and will extraploate it for future predictions. This will contribute enormously to increase their bias, and thus more misclassifications. You don't want your model to do that. This _coincidences_ is what we usually call *noise* in the data. You don't want your model to learn the *noise* and get confused on new data.
 
+> "In order to secure the ability of the network to generalize the number of nodes has to be kept as low as possible. If you have a large excess of nodes, you network becomes a memory bank that can recall the training set to perfection, but does not perform well on samples that was not part of the training set." - Steffen B Petersen · Aalborg University
+
 Increasing the complexity of a Neural Network by adding hidden layers is a great way to overfitting, because it increases the chances of creating variables out of noise. A $53$ degree interaction between the variables is far more likely to be just noise than anything meaningful. But between linear interactions and $53$ there must be some sweetspot where our model is complex enough to gasp the non-obvious relationships, but not so complex to get fooled by noise. How do we get to that point?
 
 There are a myriaf of exotic techniques in order to avoid that. You can do some [regularization](https://en.wikipedia.org/wiki/Regularization_(mathematics)), check your generalizability by [Cross Validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics)), [dropping out](https://en.wikipedia.org/wiki/Dropout_(neural_networks)) some neurons on the way of training your Neural Network, etc. But today I want to stick to the simple stuff. We are building a feeding-forward Neural Network and we want to chose the proper amount of neurons and hidden layers in our architecture, and stick with that. Once we master this simple stuff, we'll get more fancy and build smarter configurations.
 
-A general rule of thumb that I like to apply in order to decide to decide the number of _total_ neurons in the hidden layers, is this following formula:
+Now that we have an idea of how to address the _number of hidden layers_, we should focus on the _number of neurons_ in each hidden layer. There are some dicussion in this topic, and I won't enter into many details. A general rule of thumb that I like to apply in order to decide the  _total_  number of neurons in the hidden layers, is this following formula:
 
-$$N_h = \frac{n_s}{\alpha (N_i + N_o)}$$
+$$N_h = \frac{n_sN_o}{\alpha N_i}$$
 
 Where
 
 * $N_i$ is the number of _input_ neurons.
 * $N_o$ is the number of _output_ neurons.
 * $n_s$ is the number of _samples_ in the training  data set.
-* $\alpha$ is an arbitrary scaling factor between 1 and 10.
+* $\alpha$ is an arbitrary scaling factor between 1 and 100. Though you can scale it up as much as you need.
 
 This not solves the problem by itself, but now it is boiled down. Our concern would be to decide which is the $\alpha$, which is much simpler.
 
 Now we are going to build Neural Networks using this rule of thumb and evaluate an optimal value for $\alpha$.
 
-We load the data,
-
-```{r, message = FALSE, warning = FALSE}
-digit <- fread("data/train.csv") %>% 
-	mutate(label = as.factor(label))
-```
 
 
 Our $n_s$ will be the number of instances:
@@ -191,13 +221,78 @@ N_i <- ncol(digit) - 1 + 1
 So the number of neurons present in hidden layers will be:
 
 ```{r}
-alpha <- seq(1,10, by=0.1)
-N_h <- n_s/(alpha*(N_i + N_o))
+alpha <- seq(1,100, by=1)
+N_h <- n_s*N_o/((alpha)*N_i)
 N_h
 ```
 
+And then we train and evaluate many Neural Networks using all these different amounts of neurons:
 
+```{r, message = FALSE, warning = FALSE}
 
+acc_tr <- c()
+acc_val <- c()
+
+for(i in 1:length(alpha)){
+	m <- sample(seq(from = 1, to = n_instances), n_instances*0.8, replace = FALSE)
+	train <- digit[m,]
+	val   <- digit[-m,]
+	h2o_train <- as.h2o(train)
+	h2o_val   <- as.h2o(val)
+	
+	neurons_layer <- ceiling(N_h[[i]]/3)
+
+	h2o_model <- h2o.deeplearning(x = setdiff(names(train), c("label")),
+																y = "label",
+																training_frame = h2o_train,
+																standardize = TRUE,
+																hidden = c(neurons_layer,neurons_layer,neurons_layer),
+																rate = 0.0666,
+																epochs = 10)
+	
+	predictions_val   <- as.data.frame(h2o.predict(h2o_model, h2o_val))
+	predictions_train <- as.data.frame(h2o.predict(h2o_model, h2o_train))
+	acc_tr[i]         <- confusionMatrix(predictions_train$predict, train$label) %>% .$overall %>% .["Accuracy"] %>% .[[1]]
+	print(acc_val[i]  <- confusionMatrix(predictions_val$predict, val$label) %>% .$overall %>% .["Accuracy"] %>% .[[1]])
+}
+
+results_acc <- tibble(acc_tr = acc_tr, alpha = alpha, acc_val = acc_val) 
+```
+
+```{r, echo = FALSE, warning=FALSE, message = FALSE}
+gg_acc_tr <- results_acc %>% 
+	ggplot(aes(x = alpha, y = acc_tr)) +
+	geom_jitter(colour = hp(10, house = "Ravenclaw")[[3]]) +
+	geom_smooth(colour = hp(10, house = "Ravenclaw")[[3]]) +
+	xlab("Alpha") +
+	ylab("Training Accuracy")
+
+gg_acc_val <- results_acc %>% 
+	ggplot(aes(x = alpha, y = acc_val)) +
+	geom_jitter(colour = hp(10, house = "Slytherin")[[8]]) +
+	geom_smooth(colour = hp(10, house = "Slytherin")[[8]]) +
+	xlab("Alpha") +
+	ylab("Validation Accuracy")
+
+gg_oc_rate <- results_acc %>% 
+	ggplot(aes(x = alpha, y = acc_tr/acc_val)) +
+	geom_jitter(colour = hp(10, house = "Gryffindor")[[2]]) +
+	geom_smooth(colour = hp(10, house = "Gryffindor")[[2]]) +
+	xlab("Alpha") +
+	ylab("Overfitting Rate")
+
+grid.arrange(gg_oc_rate, gg_acc_tr, gg_acc_val,
+						 layout_matrix = rbind(c(1, 1),
+						 											c(2, 3))
+						 )
+
+```
+
+Note that we have computed the `overfitting rate` by dividing the training accuracy over the validation accuracy. The higher the `overfitting rate`, the proner to overfitting our model is.
+
+See that, in general, the greater the complexity the higher the accuracy, but also the higher the overfitting rate is. So if we are gaining generalizability at the expense of accuracy, where do we put the limit? As you could've imagined, there is no easy answer for this, and the decision we'll be up to every problem. Ideally, sometimes the `Overfitting Rate` curve presents a local minimum, making the decision a bit easier.
+
+Moreover, there are other considerations to take into account when designing the architecture of a Neural Network, such as _time_.
 
 
 # Facing *Time* Constraints
@@ -206,20 +301,19 @@ One of the limitations that should concern the real-world applicability of Neura
 
 Now we are going to measure how the accuracy of a model increases by increasing its complexity. The more complex the more accurate (in this example), but the longer it takes to compute. 
 
-In order to measure it, we'll just train a simple Neural Network usuing the `h2o` package and use it for different levels of complexity. We are going to evaluate the performance of our model in a validation set and we'll write down how much time it took every time.
+In order to measure it, we'll just train a simple Neural Network usuing the `h2o` package and use it for different levels of complexity. We are going to evaluate the performance of our model in a validation set and we'll write down how much time it took every time. I'll say it again, note that we'll measure the accuracy in the _validation_ set.
 
 ```{r, message = FALSE, warning = FALSE}
 digit <- fread("data/train.csv") %>% 
 	mutate(label = as.factor(label))
 ```
 
-```{r}
+```{r, message = FALSE, warning = FALSE}
 n_iters <- 1e2
 n_instances <- nrow(digit)
 acc <- c()
 time <- c()
 
-tic()
 for(i in 1:n_iters){
 	m <- sample(seq(from = 1, to = n_instances), n_instances*0.8, replace = FALSE)
 	train <- digit[m,]
